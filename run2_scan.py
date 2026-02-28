@@ -21,7 +21,61 @@ import zipfile
 import gzip
 import tarfile
 import io
+import threading
 from datetime import datetime
+
+# ============================================================
+# Skip repo: press 's' at any time to skip current repo
+# ============================================================
+_skip_flag = False
+_skip_lock = threading.Lock()
+
+
+def _key_listener():
+    """Background thread: listen for 's' keypress to set skip flag."""
+    global _skip_flag
+    try:
+        import msvcrt  # Windows
+        while True:
+            if msvcrt.kbhit():
+                ch = msvcrt.getch().lower()
+                if ch == b's':
+                    with _skip_lock:
+                        _skip_flag = True
+                    print("\n  >>> SKIP REQUESTED - moving to next repo...", flush=True)
+            time.sleep(0.1)
+    except ImportError:
+        # Linux/Mac fallback
+        import tty
+        import termios
+        import select
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while True:
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    ch = sys.stdin.read(1).lower()
+                    if ch == 's':
+                        with _skip_lock:
+                            _skip_flag = True
+                        print("\n  >>> SKIP REQUESTED - moving to next repo...", flush=True)
+        except Exception:
+            pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def should_skip():
+    global _skip_flag
+    with _skip_lock:
+        return _skip_flag
+
+
+def reset_skip():
+    global _skip_flag
+    with _skip_lock:
+        _skip_flag = False
 
 
 # ============================================================
@@ -489,11 +543,16 @@ def main():
     log("  RUN 2 - EXHAUSTIVE CONTENT SCAN")
     log(f"  Target: {BASE_URL}")
     log(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log(f"  Press 's' at any time to SKIP the current repo")
     log("=" * W)
 
     username = input("\nUsername: ").strip()
     password = getpass.getpass("Password: ")
     auth = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+
+    # Start skip-key listener
+    t = threading.Thread(target=_key_listener, daemon=True)
+    t.start()
 
     # Test
     log("\nConnecting...")
@@ -517,16 +576,17 @@ def main():
     all_findings = []
     stats = {
         "text_scanned": 0, "archives_scanned": 0, "archives_skipped_size": 0,
-        "entries_scanned": 0, "files_not_text": 0, "errors": 0,
+        "entries_scanned": 0, "files_not_text": 0, "errors": 0, "repos_skipped": 0,
     }
     total_repos = len(scan_repos)
     scan_start = time.time()
 
     for repo_idx, repo in enumerate(scan_repos, 1):
+        reset_skip()
         elapsed = time.time() - scan_start
         elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
 
-        log(f"\n[{repo_idx}/{total_repos}] {repo}  ({elapsed_str} elapsed, {len(all_findings)} findings)")
+        log(f"\n[{repo_idx}/{total_repos}] {repo}  ({elapsed_str} elapsed, {len(all_findings)} findings)  [press 's' to skip]")
 
         result = aql(f'items.find({{"repo":"{repo}"}}).include("name","size","path")', auth)
         if isinstance(result, dict) and result.get("_error"):
@@ -566,7 +626,13 @@ def main():
         log(f"  {len(text_files)} text + {len(archive_files)} archives ({skipped} binary skipped)")
 
         # --- Scan direct text files ---
+        repo_skipped = False
         for i, (fp, size) in enumerate(text_files, 1):
+            if should_skip():
+                log(f"  >>> SKIPPED at text file {i}/{len(text_files)}")
+                repo_skipped = True
+                break
+
             if i % 50 == 0:
                 log(f"    text {i}/{len(text_files)}...")
 
@@ -583,8 +649,17 @@ def main():
             all_findings.extend(findings)
             stats["text_scanned"] += 1
 
+        if repo_skipped:
+            stats["repos_skipped"] += 1
+            continue
+
         # --- Scan archives (with nesting) ---
         for i, (fp, size, ext) in enumerate(archive_files, 1):
+            if should_skip():
+                log(f"  >>> SKIPPED at archive {i}/{len(archive_files)}")
+                repo_skipped = True
+                break
+
             size_mb = round(size / 1024 / 1024, 1)
 
             if size > MAX_ARCHIVE_SIZE:
@@ -600,9 +675,11 @@ def main():
                 stats["errors"] += 1
                 continue
 
-            before = stats["entries_scanned"]
             scan_archive_entries(raw, fp, ext, depth=2, stats=stats, all_findings=all_findings)
             stats["archives_scanned"] += 1
+
+        if repo_skipped:
+            stats["repos_skipped"] += 1
 
         time.sleep(0.05)
 
