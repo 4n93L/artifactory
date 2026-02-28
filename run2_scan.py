@@ -25,27 +25,22 @@ from datetime import datetime
 
 
 # ============================================================
-# Tee: print to terminal AND write to file simultaneously
+# Output: terminal = progress + findings, file = findings ONLY
 # ============================================================
-class Tee:
-    def __init__(self, filepath):
-        self.terminal = sys.stdout
-        self.file = open(filepath, "w", encoding="utf-8")
-
-    def write(self, msg):
-        self.terminal.write(msg)
-        self.file.write(msg)
-
-    def flush(self):
-        self.terminal.flush()
-        self.file.flush()
-
-    def close(self):
-        self.file.close()
-
-
 OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tobesent")
-sys.stdout = Tee(OUTPUT_FILE)
+_findings_file = open(OUTPUT_FILE, "w", encoding="utf-8")
+
+
+def log(msg):
+    """Write to terminal only (progress, status)."""
+    print(msg, flush=True)
+
+
+def finding(msg):
+    """Write to BOTH terminal and findings file."""
+    print(msg, flush=True)
+    _findings_file.write(msg + "\n")
+    _findings_file.flush()
 
 BASE_URL = "http://10.26.1.75:8081/artifactory"
 
@@ -219,44 +214,121 @@ def is_fp(line):
     return False
 
 
+# Words that are NOT real secrets when found as a value
+JUNK_VALUES = {
+    "password", "passwd", "pwd", "pass", "secret", "token", "key", "apikey",
+    "api_key", "api-key", "credential", "credentials", "cred",
+    "property", "value", "string", "text", "name", "type", "field",
+    "null", "none", "nil", "empty", "blank", "undefined", "default",
+    "true", "false", "yes", "no", "on", "off", "enabled", "disabled",
+    "required", "optional", "encrypted", "encoded", "hashed",
+    "username", "user", "login", "admin", "root",
+    "description", "label", "placeholder", "prompt", "hint", "message",
+    "config", "configuration", "setting", "settings", "param", "parameter",
+    "input", "output", "data", "info", "metadata",
+    "classpath", "filepath", "path", "file", "dir", "directory",
+    "java.lang.string", "java.lang.object",
+}
+
+# Regex for values that look like code/class references, not secrets
+JUNK_VALUE_PATTERNS = [
+    r'^[A-Z][a-z]+(?:[A-Z][a-z]+)+$',    # CamelCase class name: Property, PasswordEncoder
+    r'^[a-z]+\.[a-z]+\.',                  # Java package: com.foo.bar
+    r'^\$\{',                              # ${placeholder}
+    r'^\{\{',                              # {{template}}
+    r'^@',                                 # @annotation
+    r'^\$\(',                              # $(variable)
+    r'^%[a-zA-Z]',                         # %variable
+    r'^getenv\(',                          # getenv()
+    r'^System\.',                          # System.getProperty
+    r'^org\.',                             # org.apache...
+    r'^com\.',                             # com.example...
+    r'^net\.',                             # net.foo...
+    r'^javax?\.',                          # java. / javax.
+]
+
+
+def is_junk_value(matched_text):
+    """Check if the captured value is obviously not a real secret."""
+    # Extract just the value part (after = or : )
+    parts = re.split(r'[=:]\s*', matched_text, maxsplit=1)
+    if len(parts) < 2:
+        return False
+    val = parts[1].strip().strip("\"'<>")
+
+    if not val:
+        return True
+    if val.lower() in JUNK_VALUES:
+        return True
+    if len(val) <= 3:
+        return True
+    for p in JUNK_VALUE_PATTERNS:
+        if re.match(p, val):
+            return True
+    # All same char: "****", "xxxx", "----"
+    if len(set(val.replace(" ", ""))) <= 2:
+        return True
+    return False
+
+
 def artif_url(filepath):
     """Build the direct Artifactory download URL for a file.
     For entries inside archives: returns URL of the archive itself."""
-    base_file = filepath.split("!/")[0]  # strip nested path inside archive
+    base_file = filepath.split("!/")[0]
     return f"{BASE_URL}/{base_file}"
 
 
-def print_finding(f):
-    """Print a finding immediately so it shows up in terminal + file in real time."""
-    print(f"  !! SECRET >> [{f['type']}] in {f['file']}:{f['line']}")
-    print(f"              value:   {f['value']}")
-    print(f"              context: {f['context'][:160]}")
-    print(f"              fetch:   {artif_url(f['file'])}")
-    sys.stdout.flush()
+def write_finding(f):
+    """Write finding to both terminal and file. Compact, actionable."""
+    finding(f"─── {f['type']} ── {f['file']}:{f['line']}")
+    for ctx_line in f.get("before", []):
+        finding(f"  {ctx_line}")
+    finding(f">>  {f['context']}")
+    finding(f"  FETCH: {artif_url(f['file'])}")
+    finding("")
 
 
 def scan_text(text, filepath):
-    findings = []
+    results = []
     seen_lines = set()
-    for num, line in enumerate(text.split("\n"), 1):
+    lines = text.split("\n")
+    for num, line in enumerate(lines, 1):
         s = line.strip()
         if not s or is_fp(s):
             continue
         for label, pat in SECRET_REGEXES:
             for m in re.finditer(pat, line):
+                matched = m.group(0).strip()
+
+                # Skip junk values for password/secret/key type matches
+                if label not in ("PRIVATE KEY", "CERTIFICATE", "AWS Access Key",
+                                 "GitHub Token", "GitHub OAuth", "GitLab Token",
+                                 "Slack Token", "Slack Webhook", "NPM Auth",
+                                 "DB Connection String", "Connection String w/ pwd"):
+                    if is_junk_value(matched):
+                        continue
+
                 key = (filepath, num, label)
                 if key not in seen_lines:
                     seen_lines.add(key)
-                    finding = {
+                    before = []
+                    for offset in range(3, 0, -1):
+                        idx = num - 1 - offset
+                        if 0 <= idx < len(lines):
+                            bl = lines[idx].strip()
+                            if bl:
+                                before.append(bl[:160])
+                    f = {
                         "file": filepath,
                         "line": num,
                         "type": label,
-                        "value": m.group(0).strip(),
+                        "value": matched,
                         "context": s[:300],
+                        "before": before,
                     }
-                    findings.append(finding)
-                    print_finding(finding)
-    return findings
+                    results.append(f)
+                    write_finding(f)
+    return results
 
 
 def is_text(data, sample_size=8192):
@@ -413,37 +485,34 @@ def scan_archive_entries(archive_bytes, archive_path, ext, depth, stats, all_fin
 
 def main():
     W = 70
-    print("=" * W)
-    print("  RUN 2 - EXHAUSTIVE CONTENT SCAN")
-    print(f"  Target: {BASE_URL}")
-    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Strategy: scan ALL text in ALL files + ALL archive entries")
-    print(f"  Nested archives: 2 levels deep (war->jar->properties)")
-    print("=" * W)
+    log("=" * W)
+    log("  RUN 2 - EXHAUSTIVE CONTENT SCAN")
+    log(f"  Target: {BASE_URL}")
+    log(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log("=" * W)
 
     username = input("\nUsername: ").strip()
     password = getpass.getpass("Password: ")
     auth = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
 
     # Test
-    print("\nConnecting...", end=" ", flush=True)
+    log("\nConnecting...")
     try:
         req = urllib.request.Request(f"{BASE_URL}/api/system/ping", headers={"Authorization": auth})
         with urllib.request.urlopen(req, context=_ctx, timeout=10):
-            print("OK")
+            log("  OK")
     except Exception as e:
-        print(f"FAILED ({e})")
+        log(f"  FAILED ({e})")
         sys.exit(1)
 
     # List repos
     repos = http_json("/api/repositories", auth)
     if isinstance(repos, dict) and repos.get("_error"):
-        print(f"ERROR: {repos}")
+        log(f"ERROR: {repos}")
         sys.exit(1)
 
-    # Include REMOTE repos too (caches may contain tampered/leaked files)
     scan_repos = [r["key"] for r in repos if r.get("type") != "VIRTUAL"]
-    print(f"Repos to scan: {len(scan_repos)} (LOCAL + REMOTE, excl VIRTUAL)\n")
+    log(f"Repos to scan: {len(scan_repos)}\n")
 
     all_findings = []
     stats = {
@@ -457,24 +526,18 @@ def main():
         elapsed = time.time() - scan_start
         elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
 
-        print(f"\n{'─' * W}")
-        print(f"  REPO {repo_idx}/{total_repos}: {repo}")
-        print(f"  Elapsed: {elapsed_str} | Findings so far: {len(all_findings)} | Errors: {stats['errors']}")
-        print(f"{'─' * W}")
-        sys.stdout.flush()
+        log(f"\n[{repo_idx}/{total_repos}] {repo}  ({elapsed_str} elapsed, {len(all_findings)} findings)")
 
         result = aql(f'items.find({{"repo":"{repo}"}}).include("name","size","path")', auth)
         if isinstance(result, dict) and result.get("_error"):
-            print(f"  AQL error, skipping")
+            log(f"  AQL error, skipping")
             stats["errors"] += 1
             continue
 
         items = result.get("results", [])
         if not items:
-            print(f"  (empty)")
             continue
 
-        # Classify all files
         text_files = []
         archive_files = []
         skipped = 0
@@ -488,7 +551,6 @@ def main():
 
             if size == 0:
                 continue
-
             if ext in ARCHIVE_EXTS:
                 archive_files.append((fp, size, ext))
             elif ext in BINARY_EXTS:
@@ -499,22 +561,19 @@ def main():
                 skipped += 1
 
         if not text_files and not archive_files:
-            print(f"  {len(items)} files, all binary -> skipped")
             continue
 
-        total_in_repo = len(text_files) + len(archive_files)
-        print(f"  {len(text_files)} text + {len(archive_files)} archives + {skipped} binary-skipped = {len(items)} total")
+        log(f"  {len(text_files)} text + {len(archive_files)} archives ({skipped} binary skipped)")
 
         # --- Scan direct text files ---
         for i, (fp, size) in enumerate(text_files, 1):
-            if i % 20 == 0 or i == 1:
-                print(f"    text [{i}/{len(text_files)}] ...", flush=True)
+            if i % 50 == 0:
+                log(f"    text {i}/{len(text_files)}...")
 
             raw = http_download(fp, auth)
             if raw is None:
                 stats["errors"] += 1
                 continue
-
             if not is_text(raw):
                 stats["files_not_text"] += 1
                 continue
@@ -530,12 +589,11 @@ def main():
 
             if size > MAX_ARCHIVE_SIZE:
                 stats["archives_skipped_size"] += 1
-                print(f"    archive [{i}/{len(archive_files)}] SKIP {fp} ({size_mb} MB > limit)")
-                sys.stdout.flush()
+                log(f"    SKIP {fp} ({size_mb} MB)")
                 continue
 
-            if i % 10 == 0 or i == 1:
-                print(f"    archive [{i}/{len(archive_files)}] {fp} ({size_mb} MB)...", flush=True)
+            if i % 20 == 0 or i == 1:
+                log(f"    archive {i}/{len(archive_files)}...")
 
             raw = http_download(fp, auth)
             if raw is None:
@@ -544,34 +602,25 @@ def main():
 
             before = stats["entries_scanned"]
             scan_archive_entries(raw, fp, ext, depth=2, stats=stats, all_findings=all_findings)
-            scanned_inside = stats["entries_scanned"] - before
             stats["archives_scanned"] += 1
-
-            if scanned_inside > 0:
-                print(f"      -> {scanned_inside} text entries scanned inside")
 
         time.sleep(0.05)
 
     # ============================================================
-    # OUTPUT
+    # FINAL SUMMARY (written to BOTH terminal and file)
     # ============================================================
-    print(f"\n{'=' * W}")
-    print(f"  SCAN COMPLETE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'=' * W}")
-    print(f"  Direct text files scanned:   {stats['text_scanned']}")
-    print(f"  Files rejected (binary):     {stats['files_not_text']}")
-    print(f"  Archives opened:             {stats['archives_scanned']}")
-    print(f"  Archives skipped (too big):  {stats['archives_skipped_size']}")
-    print(f"  Entries scanned in archives: {stats['entries_scanned']}")
-    print(f"  Errors:                      {stats['errors']}")
-    print(f"  === SECRETS FOUND:           {len(all_findings)} ===")
+    finding("")
+    finding("=" * W)
+    finding(f"  SCAN COMPLETE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    finding(f"  Text scanned: {stats['text_scanned']} | Archives: {stats['archives_scanned']} | Entries: {stats['entries_scanned']} | Errors: {stats['errors']}")
+    finding(f"  TOTAL FINDINGS: {len(all_findings)}")
+    finding("=" * W)
 
     if not all_findings:
-        print(f"\n  No secrets detected.")
-        print(f"{'=' * W}")
+        finding("  No secrets detected.")
         return
 
-    # Deduplicate (same value in multiple locations)
+    # Deduplicate
     unique = {}
     for f in all_findings:
         key = (f["type"], f["value"])
@@ -581,87 +630,9 @@ def main():
             unique[key]["locations"].append(f["file"])
 
     deduped = list(unique.values())
+    finding(f"  Unique secrets: {len(deduped)}")
 
-    # ── Categorize for actionable output ──
-
-    cat_credentials = []  # password/username pairs
-    cat_tokens = []       # API tokens, bearer, etc.
-    cat_keys = []         # private keys, certs
-    cat_connstrings = []  # connection strings with embedded creds
-    cat_other = []        # everything else
-
-    cred_types = {"Password (quoted)", "Password (unquoted)", "Spring datasource pwd",
-                  "Maven server password", "Maven server username", "JNDI datasource pwd",
-                  "LDAP Bind password", "Credential field", "XML password tag",
-                  "JNDI resource pwd", "Keystore password", "SSH passphrase",
-                  "Secret/Key (quoted)", "Secret/Key (unquoted)", "Hex secret 32+",
-                  "Base64 long secret", "Encrypted (ENC)"}
-    token_types = {"GitHub Token", "GitHub OAuth", "GitLab Token", "Slack Token",
-                   "Slack Webhook", "NPM Auth", "Docker Auth", "Artifactory Token",
-                   "SonarQube Token", "Bearer Token", "Basic Auth b64",
-                   "AWS Access Key", "AWS Secret", "AWS Session Token",
-                   "Azure Client Secret", "GCP Service Account",
-                   "Private URL w/ token", "Webhook URL w/ secret"}
-    key_types = {"PRIVATE KEY", "CERTIFICATE", "SSH key ref", "Encryption IV/Salt"}
-    conn_types = {"DB Connection String", "JDBC w/ password", "JDBC full string",
-                  "Connection String w/ pwd"}
-
-    for f in deduped:
-        t = f["type"]
-        if t in key_types:
-            cat_keys.append(f)
-        elif t in conn_types:
-            cat_connstrings.append(f)
-        elif t in token_types:
-            cat_tokens.append(f)
-        elif t in cred_types:
-            cat_credentials.append(f)
-        else:
-            cat_other.append(f)
-
-    def print_category(title, items):
-        if not items:
-            return
-        print(f"\n{'━' * W}")
-        print(f"  {title} ({len(items)})")
-        print(f"{'━' * W}")
-        for i, f in enumerate(items, 1):
-            locs = f["locations"]
-            loc_str = locs[0]
-            print(f"\n  [{i}] {f['type']}")
-            print(f"      VALUE:    {f['value']}")
-            print(f"      CONTEXT:  {f['context'][:180]}")
-            print(f"      FILE:     {loc_str}")
-            print(f"      FETCH:    {artif_url(loc_str)}")
-            if len(locs) > 1:
-                print(f"      ALSO IN:  {len(locs)-1} other location(s):")
-                for other in locs[1:5]:
-                    print(f"                {other}")
-                if len(locs) > 5:
-                    print(f"                ... and {len(locs)-5} more")
-
-    print_category("CREDENTIALS (passwords, secrets, keys in config)", cat_credentials)
-    print_category("TOKENS (API keys, OAuth, platform tokens)", cat_tokens)
-    print_category("PRIVATE KEYS & CERTIFICATES", cat_keys)
-    print_category("CONNECTION STRINGS (DB, LDAP, AMQP...)", cat_connstrings)
-    print_category("OTHER FINDINGS", cat_other)
-
-    # ── Quick copy-paste summary ──
-    print(f"\n{'━' * W}")
-    print(f"  QUICK SUMMARY - unique secrets to rotate/revoke")
-    print(f"{'━' * W}")
-    print(f"\n  Credentials:        {len(cat_credentials)}")
-    print(f"  Tokens:             {len(cat_tokens)}")
-    print(f"  Private keys/certs: {len(cat_keys)}")
-    print(f"  Connection strings: {len(cat_connstrings)}")
-    print(f"  Other:              {len(cat_other)}")
-    print(f"  ─────────────────────────")
-    print(f"  TOTAL unique:       {len(deduped)}")
-    print(f"  TOTAL raw:          {len(all_findings)}")
-
-    print(f"\n{'=' * W}")
-    print(f"  SCAN DONE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'=' * W}")
+    _findings_file.close()
 
 
 if __name__ == "__main__":
