@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Run 2b: Clean credentials scan. Zero noise.
-- Starts with repos NOT yet covered, then does the rest.
-- Skips CSS, i18n, Liferay, localization, javadoc, library jars.
-- Multi-threaded.
+Run 2b: Zero-noise credential scanner.
+Only scans CONFIG files (properties, yml, json, xml configs, shell scripts, env, docker).
+Skips ALL code, CSS, JS, i18n, HTML, Java.
+Multi-threaded.
 """
 
 import json, sys, os, re, getpass, urllib.request, urllib.error, ssl, base64
@@ -22,7 +22,7 @@ BASE_URL = "http://10.26.1.75:8081/artifactory"
 MAX_ARCHIVE = 200 * 1024 * 1024
 MAX_ENTRY = 10 * 1024 * 1024
 
-# Repos already scanned in previous run - do these LAST
+# Repos already covered - scan LAST
 ALREADY_DONE = {
     "ads-release-local", "ads-snapshot-local", "atlas-release-local",
     "elogcard-release-local", "hyperion-search", "kneo-local-dependencies",
@@ -31,27 +31,57 @@ ALREADY_DONE = {
 }
 
 # ============================================================
-# Skip logic - AGGRESSIVE noise filtering
+# FILE WHITELIST - only scan these file types
 # ============================================================
 
-# Skip these PATHS inside archives
-_SKIP_PATH = [re.compile(p) for p in [
+# Config file extensions we always scan
+_CONFIG_EXTS = {
+    ".properties", ".yml", ".yaml", ".env", ".conf", ".cfg", ".ini",
+    ".sh", ".bat", ".ps1", ".cmd",
+}
+
+# Config file NAME patterns (matched against basename)
+_CONFIG_NAMES = [re.compile(p, re.I) for p in [
+    r'^portal-ext\.properties$',
+    r'^application[\w\-]*\.(properties|yml|yaml)$',
+    r'^bootstrap[\w\-]*\.(yml|yaml)$',
+    r'^docker-compose[\w\-]*\.(yml|yaml)$',
+    r'^Dockerfile',
+    r'^\.env',
+    r'^\.npmrc$', r'^\.pypirc$', r'^\.netrc$', r'^\.git-credentials$',
+    r'^\.htpasswd$', r'^\.dockercfg$',
+    r'^settings\.xml$',
+    r'^(app|config|appsettings|credentials|secrets)[\w\-]*\.(json|xml|properties|yml|yaml|conf)$',
+    r'^(context|datasource|server|proxy|standalone|domain)[\w\-]*\.xml$',
+    r'^terraform\.tfvars$', r'\.auto\.tfvars$',
+    r'^kubeconfig$', r'.*\.kubeconfig$',
+    r'^vault\.(json|yml|yaml)$',
+    r'^(keycloak|realm)[\w\-]*\.json$',
+    r'^Jenkinsfile$', r'^\.gitlab-ci\.yml$',
+    r'.*secret.*', r'.*credential.*',
+    r'^delete_company\.sh$',  # known finding
+]]
+
+# Files to NEVER scan even if extension matches
+_SKIP_NAMES = [re.compile(p, re.I) for p in [
+    r'^Language[\w_]*\.properties$',
+    r'^messages[\w_]*\.properties$',
+    r'^LocalStrings[\w_]*\.properties$',
+    r'^ValidationMessages',
+    r'^LocalizedErrorMessages',
+    r'[\w]*Error[\w]*\.properties$',
+    r'^pingfederate-messages',
+]]
+
+# Inside archives: library paths to always skip
+_SKIP_LIB = [re.compile(p) for p in [
     r'/org/apache/', r'/org/springframework/', r'/org/hibernate/',
     r'/org/eclipse/', r'/org/jboss/', r'/org/wildfly/',
     r'/com/sun/', r'/com/oracle/', r'/com/google/', r'/com/fasterxml/',
-    r'/com/amazonaws/', r'/com/liferay/', r'/com/mysql/jdbc/LocalizedError',
+    r'/com/amazonaws/', r'/com/liferay/', r'/com/mysql/',
     r'/javax/', r'/jakarta/',
     r'/META-INF/maven/', r'/META-INF/MANIFEST',
-    r'/messages_\w+\.properties', r'/LocalStrings\.properties',
-    r'/ValidationMessages', r'/Language\.properties', r'/Language_\w+\.properties',
-    r'\.class$', r'\.MF$', r'\.SF$', r'\.RSA$', r'\.DSA$', r'\.EC$',
-    r'/license', r'/LICENSE', r'/NOTICE', r'/changelog', r'/CHANGELOG',
-    # CSS/font files = compass/token noise
-    r'\.css$', r'\.less$', r'\.scss$', r'\.svg$', r'\.woff', r'\.ttf$', r'\.eot$',
-    # JS libraries
-    r'/node_modules/', r'\.min\.js$', r'/jquery', r'/bootstrap',
-    # Liferay / portal i18n
-    r'/html/form/', r'/local\.identity/', r'/forgot-password',
+    r'/node_modules/', r'/vendor/', r'/bower_components/',
 ]]
 
 BINARY_EXTS = {
@@ -63,119 +93,154 @@ BINARY_EXTS = {
     ".sha1", ".sha256", ".sha512", ".md5", ".sig", ".asc",
     ".deb", ".rpm", ".msi", ".apk",
     ".pdf", ".swf", ".dat", ".bin", ".iso",
-    # Also skip CSS/JS font noise at top level
-    ".css", ".less", ".scss",
+    ".css", ".less", ".scss", ".sass",
+    ".java", ".kt", ".scala", ".groovy",
+    ".js", ".ts", ".jsx", ".tsx", ".mjs",
+    ".html", ".htm", ".xhtml", ".jsp", ".ftl", ".vm",
+    ".c", ".h", ".cpp", ".hpp", ".cs", ".go", ".rs",
+    ".png", ".gif", ".ico",
+    ".MF", ".SF", ".RSA", ".DSA", ".EC",
+    ".md", ".txt", ".adoc", ".rst",
+    ".sql",
 }
 
 ARCHIVE_EXTS = {".jar", ".war", ".ear", ".zip", ".gz", ".tgz", ".tar"}
 NESTED_ARCHIVE_EXTS = {".jar", ".zip", ".war", ".ear"}
 
-# ============================================================
-# Regexes - ONLY high-signal
-# ============================================================
-SECRET_REGEXES = [
-    # Connection strings user:pass@host
-    ("CONN_STRING",  re.compile(r'(?i)(mongodb|postgres|postgresql|mysql|redis|amqp|mssql|oracle|sqlserver|ldap|ldaps|ftp|ftps|smb|ssh)://[^\s"\'<>]*:[^\s"\'<>]*@[^\s"\'<>]+')),
-    # JDBC with password
-    ("JDBC_PWD",     re.compile(r'(?i)jdbc:[a-z:]+//[^\s"]*password=[^\s"&]+')),
-    # spring.*.password = realvalue
-    ("SPRING_PWD",   re.compile(r'(?i)spring[\w.]*\.(password|secret)\s*[=:]\s*[^\s\$\{#]+')),
-    # key=value where key contains password/secret/token AND value is real
-    ("PWD_FIELD",    re.compile(r'(?i)^[\w.\-]*(password|passwd|pwd|secret|token|apikey|api[_-]?key|client[_-]?secret|auth[_-]?token)\s*[=:]\s*\S+')),
-    # XML <password>real</password>
-    ("XML_PWD",      re.compile(r'(?i)<(password|secret|token|apiKey|secretKey|accessKey|passphrase)[^>]*>[^<\$\{\}]{3,}</')),
-    # XML password="real"
-    ("XML_ATTR_PWD", re.compile(r'(?i)(password|secret|token|apiKey|secretKey|passwd|pwd)\s*=\s*"[^"\$\{]{3,}"')),
-    # Private keys
-    ("PRIVATE_KEY",  re.compile(r'-----BEGIN\s+(RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY-----')),
-    # AWS
-    ("AWS_KEY",      re.compile(r'AKIA[0-9A-Z]{16}')),
-    # Tokens
-    ("GITHUB_TOKEN", re.compile(r'gh[ps]_[A-Za-z0-9_]{36,}')),
-    ("GITLAB_TOKEN", re.compile(r'glpat-[A-Za-z0-9\-]{20,}')),
-    ("SLACK_TOKEN",  re.compile(r'xox[baprs]-[0-9A-Za-z\-]{10,}')),
-    # Keycloak / OAuth client secret (JSON)
-    ("OAUTH_SECRET", re.compile(r'(?i)"(client[_-]?secret|secret)"\s*:\s*"[^"\$\{]{4,}"')),
-]
 
-HIGH_CONFIDENCE = {"PRIVATE_KEY", "AWS_KEY", "GITHUB_TOKEN", "GITLAB_TOKEN", "SLACK_TOKEN", "CONN_STRING", "OAUTH_SECRET"}
+def is_config_file(filepath):
+    """Return True only if this file is a config we should scan."""
+    basename = os.path.basename(filepath)
+    _, ext = os.path.splitext(basename)
+    ext = ext.lower()
 
-# ============================================================
-# Junk value filtering
-# ============================================================
-JUNK_VALUES = {
-    "password", "passwd", "pwd", "pass", "secret", "token", "key", "apikey",
-    "api_key", "property", "value", "string", "text", "name", "type", "field",
-    "null", "none", "nil", "empty", "blank", "undefined", "default",
-    "true", "false", "yes", "no", "on", "off", "enabled", "disabled",
-    "required", "optional", "encrypted", "encoded", "hashed",
-    "username", "user", "login", "admin", "root", "test",
-    "description", "label", "placeholder", "prompt", "hint", "message",
-    "config", "configuration", "setting", "classpath", "filepath",
-    "java.lang.string", "change_me", "changeme", "fixme", "todo",
-    "openidm-admin",  # already found
-}
+    # Skip blacklisted names first
+    for p in _SKIP_NAMES:
+        if p.search(basename):
+            return False
 
-_JUNK_PAT = [re.compile(p) for p in [
-    r'^[A-Z][a-z]+(?:[A-Z][a-z]+)+$',   # CamelCase
-    r'^[a-z]+\.[a-z]+\.',                 # package
-    r'^\$[\{\(]', r'^\{\{', r'^@',
-    r'^System\.', r'^org\.', r'^com\.', r'^net\.', r'^javax?\.',
-    r'^class\s', r'^\w+\.class$',
-]]
+    # Check whitelisted extensions
+    if ext in _CONFIG_EXTS:
+        return True
 
-# Lines that are NEVER real secrets
-_FP_LINE = [re.compile(p) for p in [
-    r'^\s*[#;!]', r'^\s*//', r'^\s*\*', r'^\s*<!--',
-    r'(?i)(example\.com|example\.org|localhost)',
-    r'(?i)(changeme|your.?password|xxx+|dummy|fake|placeholder|CHANGE.?ME|replace.?me)',
-    r'\$\{[^}]+\}', r'\{\{[^}]+\}\}',
-    # CSS noise
-    r'^\s*\.[\w-]+\s*[:{]',       # .icon-compass:before {
-    r'::?before\s*\{',            # ::before {
-    r'content:\s*"\\',             # content: "\f29e"
-    # i18n / UI label noise
-    r'(?i)^(forgot|html\.form|local\.identity|bad\.user\.password)',
-    r'(?i)(enter.*password|new\s+password|confirm.*password|reset.*password|change\s+password)',
-    r'(?i)^(action\.|label\.|message\.|error\.|info\.|warning\.)',
-    # Code noise
-    r'(?i)^.*target\.password\s*=\s*password',
-    r'(?i)ConnectionProperties\.',
-    r'(?i)<password>password</password>',
-    # Exports / JS module
-    r'^exports\.',
-    r'(?i)SQL_TOKEN',
-]]
-
-
-def is_fp(line):
-    for p in _FP_LINE:
-        if p.search(line):
+    # Check whitelisted name patterns
+    for p in _CONFIG_NAMES:
+        if p.search(basename):
             return True
-    return False
 
-
-def is_junk(matched):
-    parts = re.split(r'[=:]\s*', matched, maxsplit=1)
-    if len(parts) >= 2:
-        val = parts[1].strip().strip("\"'<>/")
-        if not val or len(val) <= 2:
-            return True
-        if val.lower() in JUNK_VALUES:
-            return True
-        for p in _JUNK_PAT:
-            if p.match(val):
+    # JSON: only config-like JSON
+    if ext == ".json":
+        for p in _CONFIG_NAMES:
+            if p.search(basename):
                 return True
-        if len(set(val)) <= 2:
+        return False
+
+    # XML: only config-like XML
+    if ext == ".xml":
+        for p in _CONFIG_NAMES:
+            if p.search(basename):
+                return True
+        # Also scan if name suggests config
+        bl = basename.lower()
+        if any(w in bl for w in ["config", "context", "datasource", "server",
+                                  "proxy", "setting", "standalone", "domain",
+                                  "pom", "persistence", "web"]):
             return True
+        return False
+
     return False
 
 
-def skip_entry(path):
-    for p in _SKIP_PATH:
+def in_library_path(path):
+    """Skip known library/framework paths inside archives."""
+    for p in _SKIP_LIB:
         if p.search(path):
             return True
     return False
+
+
+# ============================================================
+# CREDENTIAL DETECTION
+# ============================================================
+
+# High-confidence patterns (always report, no value check needed)
+_ALWAYS_PATTERNS = [
+    ("CONN_STRING",  re.compile(r'(?i)(mongodb|postgres|postgresql|mysql|redis|amqp|mssql|oracle|sqlserver|ldap|ldaps|ftp|ftps|smb|ssh)://[^\s"\'<>]*:[^\s"\'<>]*@[^\s"\'<>]+')),
+    ("JDBC_PWD",     re.compile(r'(?i)jdbc:[a-z:]+//[^\s"]*password=[^\s"&]+')),
+    ("PRIVATE_KEY",  re.compile(r'-----BEGIN\s+(RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY-----')),
+    ("AWS_KEY",      re.compile(r'AKIA[0-9A-Z]{16}')),
+    ("GITHUB_TOKEN", re.compile(r'gh[ps]_[A-Za-z0-9_]{36,}')),
+    ("GITLAB_TOKEN", re.compile(r'glpat-[A-Za-z0-9\-]{20,}')),
+    ("SLACK_TOKEN",  re.compile(r'xox[baprs]-[0-9A-Za-z\-]{10,}')),
+]
+
+# Key-value patterns: key must contain sensitive word, value is validated
+_KV_KEYS = re.compile(r'(?i)(password|passwd|pwd|secret|token|apikey|api[_-]?key|client[_-]?secret|auth[_-]?token|storepass|keypass|trustpass)')
+
+# For XML attributes: password="value"
+_XML_ATTR = re.compile(r'(?i)(password|secret|token|storepass|keypass|trustpass)\s*=\s*"([^"]*)"')
+
+# For JSON: "key": "value"
+_JSON_KV = re.compile(r'(?i)"(password|passwd|secret|token|client[_-]?secret|api[_-]?key|apikey|auth[_-]?token|credentials?)"\s*:\s*"([^"]*)"')
+
+# For properties/env/shell: key=value or key: value
+_PROP_KV = re.compile(r'(?i)^[\w.\-]*(password|passwd|pwd|secret|token|apikey|api[_-]?key|client[_-]?secret|auth[_-]?token|storepass)\s*[=:]\s*(.+)$')
+
+
+def is_real_value(val):
+    """Is this value a real credential (not a placeholder, label, or code)?"""
+    val = val.strip().strip("\"'<>/")
+
+    if not val or len(val) <= 2:
+        return False
+
+    # Placeholders
+    if '${' in val or '{{' in val or '%' in val and '%' in val[1:]:
+        return False
+
+    # Spaces = human text / label
+    if ' ' in val:
+        return False
+
+    # Known non-values
+    _junk = {
+        "password", "passwd", "pwd", "pass", "secret", "token", "key", "apikey",
+        "null", "none", "nil", "empty", "blank", "undefined", "default",
+        "true", "false", "yes", "no", "on", "off",
+        "encrypted", "encoded", "hashed",
+        "property", "value", "string", "text", "name", "type", "field",
+        "changeme", "change_me", "fixme", "todo", "xxx", "yyy",
+        "description", "label", "placeholder", "prompt",
+        "classpath", "filepath",
+    }
+    if val.lower() in _junk:
+        return False
+
+    # Pure single alphabetic word = not a password (Passwort, Codigo, etc.)
+    if re.match(r'^[A-Za-z]+$', val):
+        return False
+
+    # CamelCase class name (PasswordEncoder, SecretKeyFactory, etc.)
+    if re.match(r'^[A-Z][a-z]+(?:[A-Z][a-z]+)+$', val):
+        return False
+
+    # Java package (com.foo.bar)
+    if re.match(r'^[a-z]+\.[a-z]+\.', val):
+        return False
+
+    # Starts with $ @ { = code/variable reference
+    if val[0] in '$@{':
+        return False
+
+    # All same char (*****, ===, ...)
+    if len(set(val.replace('*', ''))) <= 1:
+        return False
+
+    # Looks like: {TO_BE_DEFINED} or similar
+    if val.startswith('{') and val.endswith('}'):
+        return False
+
+    return True
 
 
 # ============================================================
@@ -265,7 +330,7 @@ def found(msg):
 
 
 # ============================================================
-# Scanning
+# Scanning a config file
 # ============================================================
 
 def ext_of(n):
@@ -281,39 +346,80 @@ def is_text(data):
         return False
 
 
-def scan_text(text, filepath):
+def scan_config(text, filepath):
+    """Scan a config file for credentials. Returns list of findings."""
     results = []
     lines = text.split("\n")
     seen = set()
+
     for num, line in enumerate(lines, 1):
         s = line.strip()
-        if not s or is_fp(s):
+        if not s or s.startswith('#') or s.startswith('//') or s.startswith('*') or s.startswith('<!--'):
             continue
-        for label, pat in SECRET_REGEXES:
+
+        # --- Always-report patterns (connection strings, keys, tokens) ---
+        for label, pat in _ALWAYS_PATTERNS:
             for m in pat.finditer(line):
-                matched = m.group(0).strip()
-                if label not in HIGH_CONFIDENCE and is_junk(matched):
-                    continue
                 key = (filepath, num, label)
                 if key in seen:
                     continue
                 seen.add(key)
-
-                ctx = []
-                for off in range(3, 0, -1):
-                    idx = num - 1 - off
-                    if 0 <= idx < len(lines) and lines[idx].strip():
-                        ctx.append(lines[idx].strip()[:160])
-
-                found(f"[{label}] {filepath}:{num}")
-                for c in ctx:
-                    found(f"  {c}")
-                found(f">>  {s[:200]}")
-                found(f"  FETCH: {BASE_URL}/{filepath.split('!/')[0]}")
-                found("")
+                _emit(filepath, num, label, s, lines)
                 results.append(1)
+
+        # --- Key=value in properties/env/shell ---
+        m = _PROP_KV.search(line)
+        if m:
+            val = m.group(2).strip()
+            if is_real_value(val):
+                key = (filepath, num, "CRED")
+                if key not in seen:
+                    seen.add(key)
+                    _emit(filepath, num, "CRED", s, lines)
+                    results.append(1)
+
+        # --- XML attributes: password="xxx" ---
+        for m in _XML_ATTR.finditer(line):
+            val = m.group(2)
+            if is_real_value(val):
+                key = (filepath, num, "XML_CRED")
+                if key not in seen:
+                    seen.add(key)
+                    _emit(filepath, num, "XML_CRED", s, lines)
+                    results.append(1)
+
+        # --- JSON "key": "value" ---
+        for m in _JSON_KV.finditer(line):
+            val = m.group(2)
+            if is_real_value(val):
+                key = (filepath, num, "JSON_CRED")
+                if key not in seen:
+                    seen.add(key)
+                    _emit(filepath, num, "JSON_CRED", s, lines)
+                    results.append(1)
+
     return results
 
+
+def _emit(filepath, num, label, line, lines):
+    """Output a finding with context."""
+    ctx = []
+    for off in range(3, 0, -1):
+        idx = num - 1 - off
+        if 0 <= idx < len(lines) and lines[idx].strip():
+            ctx.append(lines[idx].strip()[:160])
+
+    found(f"[{label}] {filepath}:{num}")
+    for c in ctx:
+        found(f"  {c}")
+    found(f">>  {line[:200]}")
+    found(f"  FETCH: {BASE_URL}/{filepath.split('!/')[0]}")
+    found("")
+
+
+# ============================================================
+# Archive scanning - only extract config files
+# ============================================================
 
 def scan_archive(data, path, ext, depth, repo):
     findings = []
@@ -330,7 +436,7 @@ def scan_archive(data, path, ext, depth, repo):
                 for entry in zf.namelist():
                     if skipped(repo) or entry.endswith("/"):
                         continue
-                    if skip_entry(entry):
+                    if in_library_path(entry):
                         continue
                     try:
                         info = zf.getinfo(entry)
@@ -339,6 +445,7 @@ def scan_archive(data, path, ext, depth, repo):
                     if info.file_size == 0 or info.file_size > MAX_ENTRY:
                         continue
                     eext = ext_of(entry)
+                    # Recurse into nested archives
                     if depth > 0 and eext in NESTED_ARCHIVE_EXTS and info.file_size < MAX_ARCHIVE:
                         try:
                             ne, nf = scan_archive(zf.read(entry), f"{path}!/{entry}", eext, depth - 1, repo)
@@ -346,7 +453,8 @@ def scan_archive(data, path, ext, depth, repo):
                         except Exception:
                             pass
                         continue
-                    if eext in BINARY_EXTS:
+                    # Only scan config files
+                    if not is_config_file(entry):
                         continue
                     try:
                         raw = zf.read(entry)
@@ -354,7 +462,7 @@ def scan_archive(data, path, ext, depth, repo):
                         continue
                     if not is_text(raw):
                         continue
-                    findings.extend(scan_text(raw.decode("utf-8", errors="replace"), f"{path}!/{entry}"))
+                    findings.extend(scan_config(raw.decode("utf-8", errors="replace"), f"{path}!/{entry}"))
                     entries += 1
 
         elif ext in (".gz", ".tgz"):
@@ -364,8 +472,9 @@ def scan_archive(data, path, ext, depth, repo):
                     try:
                         tf = tarfile.open(fileobj=io.BytesIO(dec))
                     except tarfile.TarError:
-                        if is_text(dec):
-                            findings.extend(scan_text(dec.decode("utf-8", errors="replace"), path))
+                        # Plain gzip file
+                        if is_text(dec) and is_config_file(path):
+                            findings.extend(scan_config(dec.decode("utf-8", errors="replace"), path))
                             entries += 1
                         return entries, findings
                 else:
@@ -374,7 +483,7 @@ def scan_archive(data, path, ext, depth, repo):
                     for m in tf.getmembers():
                         if skipped(repo) or not m.isfile() or m.size == 0 or m.size > MAX_ENTRY:
                             continue
-                        if skip_entry(m.name):
+                        if in_library_path(m.name):
                             continue
                         mext = ext_of(m.name)
                         if mext in BINARY_EXTS:
@@ -389,9 +498,11 @@ def scan_archive(data, path, ext, depth, repo):
                             ne, nf = scan_archive(raw, f"{path}!/{m.name}", mext, depth - 1, repo)
                             entries += ne; findings.extend(nf)
                             continue
+                        if not is_config_file(m.name):
+                            continue
                         if not is_text(raw):
                             continue
-                        findings.extend(scan_text(raw.decode("utf-8", errors="replace"), f"{path}!/{m.name}"))
+                        findings.extend(scan_config(raw.decode("utf-8", errors="replace"), f"{path}!/{m.name}"))
                         entries += 1
             except Exception:
                 pass
@@ -402,7 +513,9 @@ def scan_archive(data, path, ext, depth, repo):
                     for m in tf.getmembers():
                         if skipped(repo) or not m.isfile() or m.size == 0 or m.size > MAX_ENTRY:
                             continue
-                        if skip_entry(m.name) or ext_of(m.name) in BINARY_EXTS:
+                        if in_library_path(m.name):
+                            continue
+                        if not is_config_file(m.name):
                             continue
                         try:
                             f = tf.extractfile(m)
@@ -412,7 +525,7 @@ def scan_archive(data, path, ext, depth, repo):
                             continue
                         if not is_text(raw):
                             continue
-                        findings.extend(scan_text(raw.decode("utf-8", errors="replace"), f"{path}!/{m.name}"))
+                        findings.extend(scan_config(raw.decode("utf-8", errors="replace"), f"{path}!/{m.name}"))
                         entries += 1
             except Exception:
                 pass
@@ -422,14 +535,15 @@ def scan_archive(data, path, ext, depth, repo):
 
 
 # ============================================================
-# Per-file workers
+# Workers
 # ============================================================
 
 def _do_text(fp, auth, repo):
     if skipped(repo): return [], 0
+    if not is_config_file(fp): return [], 0
     raw = http_dl(fp, auth)
     if not raw or not is_text(raw): return [], 0
-    return scan_text(raw.decode("utf-8", errors="replace"), fp), 1
+    return scan_config(raw.decode("utf-8", errors="replace"), fp), 1
 
 
 def _do_archive(fp, sz, ext, auth, repo):
@@ -442,7 +556,6 @@ def _do_archive(fp, sz, ext, auth, repo):
 # ============================================================
 # Scan one repo
 # ============================================================
-
 _gcnt = [0]
 _gl = threading.Lock()
 
@@ -488,6 +601,7 @@ def scan_repo(repo, ri, total, auth, t0):
 
     log(f"  {len(texts)} text + {len(archives)} archives")
 
+    # Parallel text
     with ThreadPoolExecutor(max_workers=WORKERS_DL) as pool:
         for fut in as_completed({pool.submit(_do_text, fp, auth, repo): fp for fp, _ in texts}):
             if skipped(repo): break
@@ -527,7 +641,7 @@ def scan_repo(repo, ri, total, auth, t0):
 def main():
     W = 70
     log("=" * W)
-    log("  RUN 2b - CLEAN CREDS (new repos first)")
+    log("  RUN 2b - ZERO NOISE (config files only)")
     log(f"  {WORKERS_DL}dl / {WORKERS_SCAN}scan / {WORKERS_REPO}repo threads")
     log(f"  {datetime.now():%Y-%m-%d %H:%M:%S}  [s=skip repo]")
     log("=" * W)
@@ -541,7 +655,7 @@ def main():
 
     threading.Thread(target=_keys, daemon=True).start()
 
-    log("\nPing...", )
+    log("\nPing...")
     try:
         req = urllib.request.Request(f"{BASE_URL}/api/system/ping", headers={"Authorization": auth})
         with urllib.request.urlopen(req, context=_ctx, timeout=10):
@@ -554,8 +668,6 @@ def main():
         log(f"ERROR: {repos}"); sys.exit(1)
 
     all_repos = [r["key"] for r in repos if r.get("type") != "VIRTUAL"]
-
-    # New repos first, already-done repos last
     new_repos = [r for r in all_repos if r not in ALREADY_DONE]
     old_repos = [r for r in all_repos if r in ALREADY_DONE]
     ordered = new_repos + old_repos
@@ -580,7 +692,7 @@ def main():
     el = time.strftime("%H:%M:%S", time.gmtime(time.time() - t0))
     found("")
     found(f"DONE - {datetime.now():%Y-%m-%d %H:%M:%S} ({el})")
-    found(f"Scanned: {ts['t']} text, {ts['a']} archives, {ts['e']} entries")
+    found(f"Scanned: {ts['t']} text, {ts['a']} archives, {ts['e']} config entries")
     found(f"CREDENTIALS FOUND: {len(all_findings)}")
 
     _ff.close()
