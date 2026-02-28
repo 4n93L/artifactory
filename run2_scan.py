@@ -23,6 +23,30 @@ import tempfile
 import io
 from datetime import datetime
 
+
+# ============================================================
+# Tee: print to terminal AND write to file simultaneously
+# ============================================================
+class Tee:
+    def __init__(self, filepath):
+        self.terminal = sys.stdout
+        self.file = open(filepath, "w", encoding="utf-8")
+
+    def write(self, msg):
+        self.terminal.write(msg)
+        self.file.write(msg)
+
+    def flush(self):
+        self.terminal.flush()
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
+OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tobesent")
+sys.stdout = Tee(OUTPUT_FILE)
+
 BASE_URL = "http://10.26.1.75:8081/artifactory"
 
 # Max archive size to download (skip huge ones)
