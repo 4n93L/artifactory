@@ -1,276 +1,349 @@
 #!/usr/bin/env python3
 """
-Artifactory Recon Script - Step 1: Inventory & suspicious file detection
-Produces a JSON report to analyze offline.
+Artifactory Post-Incident Secret Scanner
+All-in-one: find suspicious files -> download small ones -> scan content -> print only confirmed secrets.
+Zero external dependencies (stdlib only).
 """
 
 import json
 import sys
+import os
+import re
 import getpass
 import urllib.request
 import urllib.error
-import urllib.parse
 import ssl
 import base64
 import time
 from datetime import datetime
 
 BASE_URL = "http://10.26.1.75:8081/artifactory"
-REPORT_FILE = "artifactory_recon_report.json"
 
-# --- Suspicious file patterns for AQL ---
-SUSPICIOUS_NAMES = [
+# Only download & scan files smaller than this (avoid big binaries)
+MAX_SCAN_SIZE = 512 * 1024  # 512 KB
+
+# ============================================================
+# AQL file name patterns - what to search for
+# ============================================================
+SUSPICIOUS_NAME_PATTERNS = [
+    # Keys & certs
     "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore",
-    "*.crt", "*.cer", "*.der",
-    "id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*",
-    "*.env", "*.env.*", ".env",
-    "*password*", "*secret*", "*credential*", "*token*",
-    "*.properties", "*.yml", "*.yaml", "*.xml", "*.json", "*.toml", "*.ini", "*.cfg", "*.conf",
-    "settings.xml", "application.yml", "application.yaml",
-    "application-*.yml", "application-*.yaml",
-    "docker-compose*", "Dockerfile*",
-    ".npmrc", ".pypirc", ".netrc", ".git-credentials",
-    ".htpasswd", ".htaccess",
-    "known_hosts", "authorized_keys",
+    "id_rsa", "id_rsa.*", "id_ed25519", "id_ed25519.*", "id_ecdsa", "id_ecdsa.*",
+    # Env / dotfiles with secrets
+    "*.env", ".env", ".env.*",
+    ".npmrc", ".pypirc", ".netrc", ".git-credentials", ".htpasswd",
+    ".dockercfg", "*.dockerconfigjson",
+    # Config files likely to hold creds
+    "settings.xml",
+    "application.yml", "application.yaml", "application.properties",
+    "application-*.yml", "application-*.yaml", "application-*.properties",
+    "bootstrap.yml", "bootstrap.yaml",
+    "docker-compose*.yml", "docker-compose*.yaml",
     "wp-config.php", "config.php", "database.yml",
-    "credentials", "credentials.*",
-    "kubeconfig", "kube.config", "*.kubeconfig",
-    "terraform.tfvars", "*.tfvars",
-    "vault.json", "vault.yml",
+    "kubeconfig", "*.kubeconfig", "kube.config",
+    "terraform.tfvars", "*.tfvars", "*.auto.tfvars",
+    "vault.json", "vault.yml", "vault.yaml",
+    # Explicit names
+    "credentials", "credentials.*", "credential", "credential.*",
+    "*password*", "*secret*", "*credential*", "*credentials*", "*token*",
+    # CI/CD
+    ".gitlab-ci.yml", "Jenkinsfile",
 ]
 
-# High-priority patterns (most likely to contain raw secrets)
-HIGH_PRIORITY_NAMES = [
-    "*.pem", "*.key", "*.p12", "*.pfx", "*.jks",
-    "id_rsa*", "id_ed25519*", "id_ecdsa*",
-    "*.env", ".env",
-    ".npmrc", ".pypirc", ".netrc", ".git-credentials",
-    ".htpasswd",
-    "*password*", "*secret*", "*credential*",
-    "terraform.tfvars",
-    "kubeconfig",
+# ============================================================
+# Content regex patterns - what counts as a real secret
+# ============================================================
+SECRET_REGEXES = [
+    ("Private Key",             r'-----BEGIN\s+(RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----'),
+    ("AWS Access Key",          r'AKIA[0-9A-Z]{16}'),
+    ("AWS Secret Key",          r'(?i)aws.?secret.?access.?key\s*[=:]\s*["\']?[A-Za-z0-9/+=]{30,}'),
+    ("GitHub Token",            r'gh[ps]_[A-Za-z0-9_]{36,}'),
+    ("GitLab Token",            r'glpat-[A-Za-z0-9\-]{20,}'),
+    ("Slack Token",             r'xox[baprs]-[0-9A-Za-z\-]{10,}'),
+    ("NPM Auth Token",         r'//[^\s]*:_authToken=[^\s]+'),
+    ("Docker Auth",             r'"auth"\s*:\s*"[A-Za-z0-9+/=]{20,}"'),
+    ("Connection String /w pwd",r'(?i)(mongodb|postgres|mysql|redis|amqp|mssql)://[^\s"\']*:[^\s"\']*@'),
+    ("JDBC w/ password",        r'(?i)jdbc:[a-z]+://[^\s"]*password=[^\s"&]+'),
+    ("Bearer Token",            r'(?i)(authorization|bearer)\s*[=:]\s*["\']?bearer\s+[a-zA-Z0-9\-_.~+/]{20,}'),
+    ("Basic Auth (b64)",        r'(?i)(authorization)\s*[=:]\s*["\']?basic\s+[A-Za-z0-9+/=]{10,}'),
+    ("Password assignment",     r'(?i)(password|passwd|pwd|pass)\s*[=:]\s*["\']([^"\']{4,})["\']'),
+    ("Secret/Token assignment", r'(?i)(secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?token)\s*[=:]\s*["\']([^"\']{8,})["\']'),
+    ("Password (unquoted)",     r'(?i)(password|passwd|pwd)\s*[=:]\s*([^\s"\'#]{6,})'),
+    ("Secret (unquoted)",       r'(?i)(secret_key|api_key|apikey|access_key|token|auth_token)\s*[=:]\s*([^\s"\'#]{10,})'),
+    ("SSH key in variable",     r'(?i)ssh[_-]?(private[_-]?key|key|rsa)\s*[=:]\s*["\'].+'),
+    ("Hex secret (32+)",        r'(?i)(secret|key|token|password|salt)\s*[=:]\s*["\']?[0-9a-f]{32,}'),
 ]
 
+# Lines matching these are almost certainly NOT real secrets (false positive filters)
+FALSE_POSITIVE_PATTERNS = [
+    r'^\s*#',                          # commented out
+    r'^\s*//',                         # commented out
+    r'\$\{',                           # ${variable} placeholder
+    r'\{\{',                           # {{template}} placeholder
+    r'%\w+%',                          # %VARIABLE% placeholder
+    r'(?i)(example|changeme|replace|your[_-]?|xxx|dummy|fake|test|placeholder|TODO)',
+    r'(?i)^\s*(public|private|protected)\s',  # Java/C# access modifiers
+    r'^\s*\*',                         # Javadoc/comment block
+]
 
-def make_request(endpoint, method="GET", data=None, auth_header=None):
-    """Make HTTP request to Artifactory API."""
-    url = f"{BASE_URL}{endpoint}"
-    headers = {"Content-Type": "application/json"}
-    if auth_header:
-        headers["Authorization"] = auth_header
+# ============================================================
+# HTTP
+# ============================================================
 
-    if data and isinstance(data, str):
-        headers["Content-Type"] = "text/plain"
-        req = urllib.request.Request(url, data=data.encode("utf-8"), headers=headers, method=method)
-    elif data:
-        req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers, method=method)
-    else:
-        req = urllib.request.Request(url, headers=headers, method=method)
+_ctx = ssl.create_default_context()
+_ctx.check_hostname = False
+_ctx.verify_mode = ssl.CERT_NONE
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
 
+def http_get(endpoint, auth, raw=False):
+    url = endpoint if endpoint.startswith("http") else f"{BASE_URL}{endpoint}"
+    req = urllib.request.Request(url, headers={"Authorization": auth})
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, context=_ctx, timeout=60) as resp:
+            data = resp.read()
+            return data if raw else json.loads(data.decode("utf-8"))
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500]
-        return {"_error": True, "status": e.code, "detail": body, "url": url}
+        return {"_error": True, "status": e.code, "url": url}
     except Exception as e:
         return {"_error": True, "detail": str(e), "url": url}
 
 
-def aql_search(query, auth_header):
-    """Run an AQL query."""
+def aql_search(query, auth):
     url = f"{BASE_URL}/api/search/aql"
-    headers = {
-        "Content-Type": "text/plain",
-        "Authorization": auth_header,
-    }
-    req = urllib.request.Request(url, data=query.encode("utf-8"), headers=headers, method="POST")
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
+    req = urllib.request.Request(url, data=query.encode("utf-8"), headers={
+        "Content-Type": "text/plain", "Authorization": auth,
+    }, method="POST")
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=120) as resp:
+        with urllib.request.urlopen(req, context=_ctx, timeout=120) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500]
-        return {"_error": True, "status": e.code, "detail": body}
+        return {"_error": True, "status": e.code}
     except Exception as e:
         return {"_error": True, "detail": str(e)}
 
 
+# ============================================================
+# Content scanning
+# ============================================================
+
+def is_false_positive(line):
+    for fp in FALSE_POSITIVE_PATTERNS:
+        if re.search(fp, line):
+            return True
+    return False
+
+
+def mask(value):
+    """Show just enough to identify the secret without fully exposing it."""
+    v = value.strip().strip("\"'")
+    if len(v) > 20:
+        return v[:6] + "..." + v[-4:]
+    elif len(v) > 10:
+        return v[:4] + "..." + v[-3:]
+    else:
+        return v[:3] + "***"
+
+
+def scan_text(text, filepath):
+    findings = []
+    for line_num, line in enumerate(text.split("\n"), 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if is_false_positive(stripped):
+            continue
+        for label, pattern in SECRET_REGEXES:
+            for m in re.finditer(pattern, line):
+                findings.append({
+                    "file": filepath,
+                    "line": line_num,
+                    "type": label,
+                    "match": mask(m.group(0)),
+                    "context": stripped[:150],
+                })
+    return findings
+
+
+# ============================================================
+# Main
+# ============================================================
+
 def main():
-    print("=" * 60)
-    print("  ARTIFACTORY RECON - Post-Incident Secret Scanner")
-    print("=" * 60)
-    print(f"\nTarget: {BASE_URL}")
-    print()
+    W = 70
+    print("=" * W)
+    print("  ARTIFACTORY POST-INCIDENT SECRET SCANNER")
+    print(f"  Target: {BASE_URL}")
+    print(f"  Date:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * W)
 
-    username = input("Username: ").strip()
+    username = input("\nUsername: ").strip()
     password = getpass.getpass("Password: ")
-    creds = base64.b64encode(f"{username}:{password}".encode()).decode()
-    auth_header = f"Basic {creds}"
+    auth = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
 
-    report = {
-        "scan_date": datetime.now().isoformat(),
-        "target": BASE_URL,
-        "repos": [],
-        "suspicious_files": [],
-        "high_priority_files": [],
-        "errors": [],
-        "stats": {},
-    }
+    # ---- 1. Connectivity ----
+    print("\n[1/5] Testing connection...", end=" ", flush=True)
+    try:
+        req = urllib.request.Request(f"{BASE_URL}/api/system/ping", headers={"Authorization": auth})
+        with urllib.request.urlopen(req, context=_ctx, timeout=10) as r:
+            print("OK")
+    except Exception as e:
+        print(f"FAILED ({e})")
+        sys.exit(1)
 
-    # ---- Step 1: Test connection ----
-    print("\n[1/4] Testing connection...")
-    ping = make_request("/api/system/ping", auth_header=auth_header)
-    if isinstance(ping, dict) and ping.get("_error"):
-        # ping returns plain text "OK", try raw
-        url = f"{BASE_URL}/api/system/ping"
-        headers = {"Authorization": auth_header}
-        req = urllib.request.Request(url, headers=headers)
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        try:
-            with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
-                text = resp.read().decode()
-                if "OK" in text.upper():
-                    print("  -> Connection OK")
-                else:
-                    print(f"  -> Unexpected response: {text}")
-        except Exception as e:
-            print(f"  -> Connection FAILED: {e}")
-            print("  Check URL, credentials, and VPN.")
-            sys.exit(1)
-    else:
-        print("  -> Connection OK")
-
-    # ---- Step 2: List all repos ----
-    print("\n[2/4] Listing repositories...")
-    repos = make_request("/api/repositories", auth_header=auth_header)
+    # ---- 2. List repos ----
+    print("[2/5] Listing repos...", end=" ", flush=True)
+    repos = http_get("/api/repositories", auth)
     if isinstance(repos, dict) and repos.get("_error"):
-        print(f"  -> ERROR listing repos: {repos}")
-        report["errors"].append({"step": "list_repos", "error": repos})
-    else:
-        print(f"  -> Found {len(repos)} repositories")
-        for r in repos:
-            print(f"     - {r.get('key', '?'):40s}  type={r.get('type', '?'):10s}  pkg={r.get('packageType', '?')}")
-        report["repos"] = repos
+        print(f"ERROR {repos}")
+        sys.exit(1)
+    print(f"{len(repos)} repos found")
 
-    # ---- Step 3: Get storage info ----
-    print("\n[3/4] Getting storage info (may take a moment)...")
-    storage = make_request("/api/storageinfo", auth_header=auth_header)
+    # ---- 3. Storage info ----
+    print("[3/5] Storage info...", end=" ", flush=True)
+    storage = http_get("/api/storageinfo", auth)
     if isinstance(storage, dict) and not storage.get("_error"):
-        repo_summaries = storage.get("repositoriesSummaryList", [])
-        total_size = storage.get("binariesSummary", {}).get("binariesSize", "unknown")
-        print(f"  -> Total binaries size: {total_size}")
-        report["storage_summary"] = {
-            "total_size": total_size,
-            "repos": []
-        }
-        for rs in repo_summaries:
-            key = rs.get("repoKey", "?")
-            used = rs.get("usedSpace", "?")
-            files = rs.get("filesCount", 0)
-            report["storage_summary"]["repos"].append({
-                "key": key, "usedSpace": used, "filesCount": files
-            })
-            if key != "TOTAL":
-                print(f"     - {key:40s}  size={used:>12s}  files={files}")
+        total = storage.get("binariesSummary", {}).get("binariesSize", "?")
+        print(f"total = {total}")
     else:
-        print(f"  -> Could not get storage info: {storage}")
-        report["errors"].append({"step": "storage_info", "error": str(storage)})
+        print("(skipped)")
 
-    # ---- Step 4: AQL search for suspicious files ----
-    print("\n[4/4] Searching for suspicious files via AQL...")
+    # ---- 4. AQL search for suspicious files ----
+    print(f"[4/5] AQL search ({len(SUSPICIOUS_NAME_PATTERNS)} patterns)...")
 
-    # Build AQL OR conditions for all suspicious patterns
-    or_clauses = []
-    for pattern in SUSPICIOUS_NAMES:
-        or_clauses.append(f'{{"name": {{"$match": "{pattern}"}}}}')
+    all_items = []
+    batch_size = 10
+    for i in range(0, len(SUSPICIOUS_NAME_PATTERNS), batch_size):
+        batch = SUSPICIOUS_NAME_PATTERNS[i:i + batch_size]
+        clauses = ",".join(f'{{"name":{{"$match":"{p}"}}}}' for p in batch)
+        q = f'items.find({{"$or":[{clauses}]}}).include("repo","path","name","size","created","modified","actual_sha1")'
+        result = aql_search(q, auth)
+        if isinstance(result, dict) and not result.get("_error"):
+            hits = result.get("results", [])
+            all_items.extend(hits)
+            print(f"  batch {i // batch_size + 1}: {len(hits)} hits")
+        else:
+            print(f"  batch {i // batch_size + 1}: ERROR {result}")
+        time.sleep(0.3)
 
-    aql_query = f'items.find({{"$or": [{",".join(or_clauses)}]}}).include("repo","path","name","size","created","modified","actual_sha1")'
+    # Dedupe
+    seen = set()
+    items = []
+    for it in all_items:
+        p = it.get("path", ".")
+        fp = f"{it['repo']}/{p}/{it['name']}" if p != "." else f"{it['repo']}/{it['name']}"
+        it["_fp"] = fp
+        if fp not in seen:
+            seen.add(fp)
+            items.append(it)
 
-    print(f"  -> Running AQL query ({len(SUSPICIOUS_NAMES)} patterns)...")
-    result = aql_search(aql_query, auth_header)
+    print(f"  -> {len(items)} unique suspicious files")
 
-    if isinstance(result, dict) and result.get("_error"):
-        print(f"  -> AQL ERROR: {result}")
-        report["errors"].append({"step": "aql_search", "error": result})
+    # ---- 5. Download & scan ----
+    scannable = [f for f in items if 0 < f.get("size", 0) < MAX_SCAN_SIZE]
+    too_big = [f for f in items if f.get("size", 0) >= MAX_SCAN_SIZE]
 
-        # Fallback: try smaller batches
-        print("  -> Trying smaller batch queries...")
-        all_results = []
-        batch_size = 10
-        for i in range(0, len(SUSPICIOUS_NAMES), batch_size):
-            batch = SUSPICIOUS_NAMES[i:i+batch_size]
-            batch_clauses = [f'{{"name": {{"$match": "{p}"}}}}' for p in batch]
-            batch_query = f'items.find({{"$or": [{",".join(batch_clauses)}]}}).include("repo","path","name","size","created","modified","actual_sha1")'
-            batch_result = aql_search(batch_query, auth_header)
-            if isinstance(batch_result, dict) and not batch_result.get("_error"):
-                items = batch_result.get("results", [])
-                all_results.extend(items)
-                print(f"     Batch {i//batch_size + 1}: {len(items)} matches")
-            else:
-                print(f"     Batch {i//batch_size + 1}: ERROR - {batch_result}")
-            time.sleep(0.5)
-        result = {"results": all_results}
+    print(f"[5/5] Downloading & scanning {len(scannable)} files (< {MAX_SCAN_SIZE//1024} KB)...")
 
-    if isinstance(result, dict) and not result.get("_error"):
-        items = result.get("results", [])
-        print(f"  -> Found {len(items)} suspicious files total")
+    all_findings = []
+    scanned = 0
+    dl_errors = 0
 
-        for item in items:
-            item["full_path"] = f"{item.get('repo','')}/{item.get('path','.')}/{item.get('name','')}"
-            item["size_kb"] = round(item.get("size", 0) / 1024, 2)
+    for idx, item in enumerate(scannable):
+        fp = item["_fp"]
+        if (idx + 1) % 50 == 0:
+            print(f"  progress: {idx+1}/{len(scannable)}...")
 
-        report["suspicious_files"] = items
+        raw = http_get(f"/{fp}", auth, raw=True)
+        if isinstance(raw, dict):
+            dl_errors += 1
+            continue
 
-        # Tag high-priority
-        hp_set = set()
-        for item in items:
-            name = item.get("name", "").lower()
-            for hp in HIGH_PRIORITY_NAMES:
-                hp_clean = hp.replace("*", "").lower()
-                if hp_clean in name or name.endswith(hp_clean):
-                    hp_set.add(item["full_path"])
-                    break
+        try:
+            text = raw.decode("utf-8", errors="replace")
+        except Exception:
+            continue
 
-        high_priority = [f for f in items if f["full_path"] in hp_set]
-        report["high_priority_files"] = high_priority
-        print(f"  -> {len(high_priority)} HIGH PRIORITY files (likely secrets)")
+        findings = scan_text(text, fp)
+        all_findings.extend(findings)
+        scanned += 1
 
-        # Print top findings
-        if high_priority:
-            print("\n  HIGH PRIORITY FILES:")
-            for f in sorted(high_priority, key=lambda x: x.get("name", ""))[:50]:
-                print(f"     [!] {f['full_path']}  ({f['size_kb']} KB)")
+    # Also flag private key files (even without content scan the file itself IS the secret)
+    key_extensions = {".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"}
+    key_names = {"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"}
+    always_critical = []
+    for item in items:
+        name = item.get("name", "")
+        _, ext = os.path.splitext(name)
+        base = name.split(".")[0]
+        if ext.lower() in key_extensions or base.lower() in key_names:
+            always_critical.append(item)
 
-    # ---- Stats summary ----
-    report["stats"] = {
-        "total_repos": len(report["repos"]),
-        "total_suspicious_files": len(report["suspicious_files"]),
-        "high_priority_files": len(report["high_priority_files"]),
-        "errors_count": len(report["errors"]),
-    }
+    # ============================================================
+    # OUTPUT: only the interesting stuff
+    # ============================================================
+    print("\n" + "=" * W)
+    print("  RESULTS")
+    print("=" * W)
 
-    # ---- Write report ----
-    with open(REPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, default=str)
+    # -- A) Confirmed secrets in file content --
+    if all_findings:
+        # Group by type
+        by_type = {}
+        for f in all_findings:
+            by_type.setdefault(f["type"], []).append(f)
 
-    print("\n" + "=" * 60)
-    print(f"  DONE - Report saved to: {REPORT_FILE}")
-    print(f"  Repos:            {report['stats']['total_repos']}")
-    print(f"  Suspicious files: {report['stats']['total_suspicious_files']}")
-    print(f"  High priority:    {report['stats']['high_priority_files']}")
-    print(f"  Errors:           {report['stats']['errors_count']}")
-    print("=" * 60)
-    print(f"\n>> Copy {REPORT_FILE} back and send it to Claude for analysis <<")
+        print(f"\n  CONFIRMED SECRETS FOUND: {len(all_findings)}")
+        print(f"  {'Type':<35} {'Count':>5}")
+        print(f"  {'-'*35} {'-'*5}")
+        for t, fs in sorted(by_type.items(), key=lambda x: -len(x[1])):
+            print(f"  {t:<35} {len(fs):>5}")
+
+        print(f"\n  {'─' * (W-4)}")
+        print("  DETAILS (grouped by file):")
+        print(f"  {'─' * (W-4)}")
+
+        by_file = {}
+        for f in all_findings:
+            by_file.setdefault(f["file"], []).append(f)
+
+        for fpath in sorted(by_file):
+            print(f"\n  >> {fpath}")
+            for f in by_file[fpath]:
+                print(f"     L{f['line']:<5}  [{f['type']}]")
+                print(f"            {f['match']}")
+                print(f"            {f['context'][:120]}")
+    else:
+        print("\n  No confirmed secrets found in file contents.")
+
+    # -- B) Critical files by extension (keys, certs) --
+    if always_critical:
+        print(f"\n  {'─' * (W-4)}")
+        print(f"  KEY/CERT FILES ({len(always_critical)} files - these ARE secrets):")
+        print(f"  {'─' * (W-4)}")
+        for item in sorted(always_critical, key=lambda x: x["_fp"]):
+            sz = round(item.get("size", 0) / 1024, 1)
+            print(f"  {item['_fp']:<60} {sz:>8} KB")
+
+    # -- C) Files too large to scan --
+    if too_big:
+        print(f"\n  {'─' * (W-4)}")
+        print(f"  SUSPICIOUS BUT TOO LARGE TO SCAN ({len(too_big)} files):")
+        print(f"  {'─' * (W-4)}")
+        for item in sorted(too_big, key=lambda x: -x.get("size", 0)):
+            sz = round(item.get("size", 0) / (1024 * 1024), 2)
+            print(f"  {item['_fp']:<60} {sz:>8} MB")
+
+    # -- Summary --
+    print(f"\n{'=' * W}")
+    print(f"  SUMMARY")
+    print(f"  Repos:                  {len(repos)}")
+    print(f"  Suspicious files found: {len(items)}")
+    print(f"  Files scanned:          {scanned}")
+    print(f"  Download errors:        {dl_errors}")
+    print(f"  Confirmed secrets:      {len(all_findings)}")
+    print(f"  Key/cert files:         {len(always_critical)}")
+    print(f"  Too large to scan:      {len(too_big)}")
+    print(f"{'=' * W}")
 
 
 if __name__ == "__main__":
